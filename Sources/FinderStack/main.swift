@@ -260,7 +260,13 @@ final class Store {
     private func openGroupForLocalHotkey(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
         guard NSApp.modalWindow == nil, !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended"), let group = Store().groups.first(where: { $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == flags }) else { return false }
-        let paths = group.folders.map(\.path); if paths.count > 1 { openFolderLayout(paths) } else if let path = paths.first { openFolder(path) }; return true
+        let paths = group.folders.map(\.path)
+        dismissPanel()
+        DispatchQueue.main.async {
+            if paths.count > 1 { self.openFolderLayout(paths) }
+            else if let path = paths.first { self.openFolder(path) }
+        }
+        return true
     }
 
     private func handleHotkey(_ id: UInt32) { if id == 1 { toggle() } else if id == 2 { dismissPanel() } }
@@ -357,7 +363,13 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
     override func viewDidAppear() {
         search.becomeFirstResponder()
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 53 { self?.onClose(); return nil }
+            guard let self else { return event }
+            if event.keyCode == 53 { self.onClose(); return nil }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
+            if NSApp.isActive, NSApp.modalWindow == nil, !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended"), let group = self.groups.first(where: { $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == flags }) {
+                self.onOpen(group.folders.map(\.path), group.folders.count > 1)
+                return nil
+            }
             return event
         }
         flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
