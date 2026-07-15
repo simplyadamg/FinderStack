@@ -105,7 +105,7 @@ final class Store {
                 if isMultiSelection { self.openFolderLayout(paths) }
                 else if let path = paths.first { self.openFolder(path) }
             }
-        } onClose: { [weak self] in self?.panel?.close(); self?.panel = nil }
+        } onClose: { [weak self] in self?.panel = nil }
         let p = NSPanel(contentViewController: controller)
         p.styleMask = [.borderless, .nonactivatingPanel]
         p.level = .floating; p.isFloatingPanel = true; p.hidesOnDeactivate = false
@@ -229,7 +229,7 @@ final class Store {
 
     private func openGroupForLocalHotkey(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
-        guard !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended"), let group = Store().groups.first(where: { $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == flags }) else { return false }
+        guard NSApp.modalWindow == nil, !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended"), let group = Store().groups.first(where: { $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == flags }) else { return false }
         let paths = group.folders.map(\.path); if paths.count > 1 { openFolderLayout(paths) } else if let path = paths.first { openFolder(path) }; return true
     }
 
@@ -253,12 +253,17 @@ final class HotkeyField: NSTextField {
     private static func keyLabel(_ event: NSEvent) -> String { switch event.keyCode { case 36: return "↩"; case 48: return "⇥"; case 49: return "Space"; case 51: return "⌫"; case 53: return "⎋"; case 122: return "F1"; case 120: return "F2"; case 99: return "F3"; case 118: return "F4"; case 96: return "F5"; case 97: return "F6"; case 98: return "F7"; case 100: return "F8"; case 101: return "F9"; case 109: return "F10"; case 103: return "F11"; case 111: return "F12"; default: return (event.charactersIgnoringModifiers ?? "").uppercased() } }
 }
 
+final class GroupTableView: NSTableView {
+    var contextMenuProvider: ((Int) -> NSMenu?)?
+    override func menu(for event: NSEvent) -> NSMenu? { let point = convert(event.locationInWindow, from: nil); return contextMenuProvider?(row(at: point)) }
+}
+
 final class PopupController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     private let folderPasteboardType = NSPasteboard.PasteboardType("com.finderstack.folder-path")
     private let groupPasteboardType = NSPasteboard.PasteboardType("com.finderstack.group-id")
     private let entries: [FolderEntry]; private var hotlist: [FolderEntry]; private var groups: [FolderGroup]
     private let onHotlistChanged: ([FolderEntry]) -> Void; private let onGroupsChanged: ([FolderGroup]) -> Void; private let onOpen: ([String], Bool) -> Void; private let onClose: () -> Void
-    private let search = NSSearchField(), recentTable = NSTableView(), hotlistTable = NSTableView(), groupTable = NSTableView()
+    private let search = NSSearchField(), recentTable = NSTableView(), hotlistTable = NSTableView(), groupTable = GroupTableView()
     private let recentScroll = NSScrollView(), hotlistScroll = NSScrollView(), groupScroll = NSScrollView()
     private var filteredRecent: [FolderEntry] = [], filteredHotlist: [FolderEntry] = [], filteredGroups: [FolderGroup] = [], selected: [FolderEntry] = []; private var flagsMonitor: Any?; private var escapeMonitor: Any?
     private var editingGroupID: UUID?
@@ -275,6 +280,7 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
         let card = NSVisualEffectView(); card.material = .popover; card.blendingMode = .behindWindow; card.state = .active; card.wantsLayer = true; card.layer?.cornerRadius = 16; card.layer?.masksToBounds = true; view = card
         search.placeholderString = "Search folders"; search.font = .systemFont(ofSize: 16); search.delegate = self; view.addSubview(search)
         configure(hotlistTable, in: hotlistScroll); configure(recentTable, in: recentScroll); configure(groupTable, in: groupScroll)
+        groupTable.contextMenuProvider = { [weak self] row in self?.contextMenu(for: row) }
         let hotLabel = NSTextField(labelWithString: "HOTLIST"); let recentLabel = NSTextField(labelWithString: "RECENT")
         for label in [hotLabel, recentLabel, groupHeader] { label.font = .systemFont(ofSize: 11, weight: .semibold); label.textColor = .secondaryLabelColor; view.addSubview(label); label.translatesAutoresizingMaskIntoConstraints = false }
         backButton.target = self; backButton.action = #selector(backToGroups); backButton.isBordered = false; backButton.isHidden = true; view.addSubview(backButton); backButton.translatesAutoresizingMaskIntoConstraints = false
@@ -384,8 +390,10 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
     @objc private func addHotlist(_ sender: NSButton) { guard filteredRecent.indices.contains(sender.tag) else { return }; let entry = filteredRecent[sender.tag]; if !hotlist.contains(where: { $0.path == entry.path }) { hotlist.append(entry); onHotlistChanged(hotlist); applyFilter() } }
     @objc private func removeHotlist(_ sender: NSButton) { guard filteredHotlist.indices.contains(sender.tag) else { return }; let entry = filteredHotlist[sender.tag]; hotlist.removeAll { $0.path == entry.path }; selected.removeAll { $0.path == entry.path }; onHotlistChanged(hotlist); applyFilter() }
     @objc private func editGroup(_ sender: NSButton) { guard filteredGroups.indices.contains(sender.tag) else { return }; openGroupEditor(filteredGroups[sender.tag]) }
+    @objc private func renameGroup(_ sender: NSMenuItem) { guard filteredGroups.indices.contains(sender.tag) else { return }; var group = filteredGroups[sender.tag]; let alert = NSAlert(); alert.messageText = "Rename Group"; let field = NSTextField(string: group.name); alert.accessoryView = field; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field; UserDefaults.standard.set(true, forKey: "groupHotkeysSuspended"); defer { UserDefaults.standard.set(false, forKey: "groupHotkeysSuspended") }; guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }; group.name = field.stringValue; groups = groups.map { $0.id == group.id ? group : $0 }; onGroupsChanged(groups); applyFilter() }
     @objc private func deleteGroup(_ sender: NSButton) { guard filteredGroups.indices.contains(sender.tag) else { return }; let group = filteredGroups[sender.tag]; let alert = NSAlert(); alert.messageText = "Delete \(group.name)?"; alert.informativeText = "The folders will remain in Recent and Hotlist."; alert.addButton(withTitle: "Delete"); alert.addButton(withTitle: "Cancel"); guard alert.runModal() == .alertFirstButtonReturn else { return }; groups.removeAll { $0.id == group.id }; onGroupsChanged(groups); applyFilter() }
     @objc private func groupHotkey(_ sender: NSButton) { guard filteredGroups.indices.contains(sender.tag) else { return }; let group = filteredGroups[sender.tag]; let alert = NSAlert(); alert.messageText = "Set Hotkey for \(group.name)"; alert.informativeText = "Press the shortcut you want to open this group."; let field = HotkeyField(frame: NSRect(x: 0, y: 0, width: 260, height: 28)); field.isEditable = false; field.isSelectable = false; field.stringValue = "Press a shortcut…"; alert.accessoryView = field; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field; UserDefaults.standard.set(true, forKey: "groupHotkeysSuspended"); defer { UserDefaults.standard.set(false, forKey: "groupHotkeysSuspended") }; guard alert.runModal() == .alertFirstButtonReturn, let event = field.event else { return }; let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue; let mainConflict = UserDefaults.standard.object(forKey: "hotkeyCode") != nil && UInt16(UserDefaults.standard.integer(forKey: "hotkeyCode")) == event.keyCode && UInt(UserDefaults.standard.integer(forKey: "hotkeyModifiers")) == modifiers; let groupConflict = groups.contains { $0.id != group.id && $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == modifiers }; guard !mainConflict && !groupConflict else { NSAlert(error: NSError(domain: "FinderStack", code: 1, userInfo: [NSLocalizedDescriptionKey: "That shortcut is already assigned to FinderStack or another group."])).runModal(); return }; groups = groups.map { var item = $0; if item.id == group.id { item.hotkeyCode = event.keyCode; item.hotkeyModifiers = modifiers; item.hotkeyDisplay = HotkeyField.display(for: event) }; return item }; onGroupsChanged(groups); applyFilter() }
+    private func contextMenu(for row: Int) -> NSMenu? { guard editingGroupID == nil, filteredGroups.indices.contains(row) else { return nil }; let menu = NSMenu(); for (title, action) in [("Rename", #selector(renameGroup(_:))), ("Remove", #selector(deleteGroup(_:))), ("Edit Group", #selector(editGroup(_:))), ("Reassign Hotkey", #selector(groupHotkey(_:)))] { let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; item.tag = row; menu.addItem(item) }; return menu }
     private func openGroupEditor(_ group: FolderGroup) { editingGroupID = group.id; backButton.isHidden = false; groupHeader.stringValue = "\(group.name)  \(group.hotkeyDisplay ?? "")"; groupTable.reloadData() }
     @objc private func backToGroups() { editingGroupID = nil; backButton.isHidden = true; groupHeader.stringValue = "GROUPS"; groupTable.reloadData() }
 }
