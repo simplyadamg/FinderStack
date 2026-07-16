@@ -159,12 +159,14 @@ final class Store {
             set selectedWindow to make new Finder window to selectedFolder
             set position of selectedWindow to {\(rightX), \(upperY)}
             set size of selectedWindow to {\(width), \(height)}
+            set index of selectedWindow to 1
             activate
         end tell
         """
         var error: NSDictionary?
         NSAppleScript(source: script)?.executeAndReturnError(&error)
-        if let error { NSLog("FinderStack arrangement failed: %@", error) }
+        if let error { NSLog("FinderStack arrangement failed: %@", error); FinderStackLog.write("single Finder window AppleScript failed: \(error)") }
+        bringFinderToFront(reason: "single folder")
     }
 
     private func openFolderLayout(_ paths: [String]) {
@@ -187,13 +189,43 @@ final class Store {
                 set selectedWindow to make new Finder window to selectedFolder
                 set position of selectedWindow to {\(frame.0), \(frame.1)}
                 set size of selectedWindow to {\(width), \(height)}
+                set index of selectedWindow to 1
             end tell
             """
             var error: NSDictionary?
             NSAppleScript(source: command)?.executeAndReturnError(&error)
-            if let error { NSLog("FinderStack could not open layout item %d: %@", index + 1, error) }
+            if let error { NSLog("FinderStack could not open layout item %d: %@", index + 1, error); FinderStackLog.write("layout item \(index + 1) AppleScript failed: \(error)") }
         }
-        NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first?.activate(options: [.activateAllWindows])
+        bringFinderToFront(reason: "folder layout")
+    }
+
+    private func bringFinderToFront(reason: String) {
+        guard let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first else {
+            FinderStackLog.write("Finder foreground failed for \(reason): no running Finder process")
+            return
+        }
+        let options: NSApplication.ActivationOptions = [.activateAllWindows]
+        NSApp.deactivate()
+        finder.unhide()
+        let immediate = finder.activate(options: options)
+        FinderStackLog.write("Finder foreground requested for \(reason): immediate=\(immediate) active=\(finder.isActive)")
+
+        if let bundleURL = finder.bundleURL {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            configuration.addsToRecentItems = false
+            NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration) { application, error in
+                if let error { FinderStackLog.write("Finder workspace activation failed for \(reason): \(error)") }
+                else { FinderStackLog.write("Finder workspace activation completed for \(reason): active=\(application?.isActive == true)") }
+            }
+        }
+
+        for delay in [0.08, 0.25] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                let activated = finder.activate(options: options)
+                FinderStackLog.write("Finder foreground reasserted for \(reason) after \(delay)s: result=\(activated) active=\(finder.isActive)")
+            }
+        }
     }
 
     private func closeAll() {
