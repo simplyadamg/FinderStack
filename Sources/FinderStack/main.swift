@@ -2,6 +2,20 @@ import AppKit
 import ServiceManagement
 import Carbon.HIToolbox
 
+enum FinderStackLog {
+    private static let lock = NSLock()
+    static let path = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/FinderStack.log")
+    static func write(_ message: String) {
+        lock.lock(); defer { lock.unlock() }
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+        let url = URL(fileURLWithPath: path)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = line.data(using: .utf8), FileManager.default.fileExists(atPath: path), let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile(); handle.write(data); try? handle.close()
+        } else { try? line.write(to: url, atomically: true, encoding: .utf8) }
+    }
+}
+
 struct FolderEntry: Codable, Identifiable, Equatable {
     let id: String
     let name: String
@@ -56,14 +70,17 @@ final class Store {
     private var localHotkeyMonitor: Any?
     private var carbonHotKey: EventHotKeyRef?
     private var escapeHotKey: EventHotKeyRef?
+    private var closeAllHotKey: EventHotKeyRef?
     private var carbonHandler: EventHandlerRef?
     private var groupHotKeys: [UUID: EventHotKeyRef] = [:]
+    private var groupHotKeyIDs: [UInt32: UUID] = [:]
     private var hotkeyCode: UInt16 { UInt16(UserDefaults.standard.integer(forKey: "hotkeyCode")) }
     private var hotkeyModifiers: NSEvent.ModifierFlags { NSEvent.ModifierFlags(rawValue: UInt(UserDefaults.standard.integer(forKey: "hotkeyModifiers"))) }
     private var closeAllCode: UInt16 { UInt16(UserDefaults.standard.integer(forKey: "closeAllCode")) }
     private var closeAllModifiers: NSEvent.ModifierFlags { NSEvent.ModifierFlags(rawValue: UInt(UserDefaults.standard.integer(forKey: "closeAllModifiers"))) }
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        FinderStackLog.write("launched; log path=\(FinderStackLog.path)")
         NSApp.setActivationPolicy(.accessory)
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.button?.title = "▰"
@@ -120,6 +137,7 @@ final class Store {
         p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
         p.setContentSize(NSSize(width: 900, height: 500)); p.center(); p.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true); panel = p
+        FinderStackLog.write("popup shown active=\(NSApp.isActive) key=\(p.isKeyWindow)")
         registerEscapeHotkey()
     }
 
@@ -205,6 +223,7 @@ final class Store {
     }
 
     private func closeAll() {
+        FinderStackLog.write("close-all shortcut handled")
         dismissPanel()
         NSAppleScript(source: "tell application \"Finder\" to close every Finder window")?.executeAndReturnError(nil)
     }
@@ -237,6 +256,9 @@ final class Store {
 
     private func installCarbonHotkey() {
         if let carbonHotKey { UnregisterEventHotKey(carbonHotKey); self.carbonHotKey = nil }
+        if let closeAllHotKey { UnregisterEventHotKey(closeAllHotKey); self.closeAllHotKey = nil }
+        for (_, ref) in groupHotKeys { UnregisterEventHotKey(ref) }
+        groupHotKeys.removeAll(); groupHotKeyIDs.removeAll()
         if carbonHandler == nil {
             var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
             let callback: EventHandlerUPP = { _, event, userData in
@@ -252,9 +274,22 @@ final class Store {
         guard UserDefaults.standard.object(forKey: "hotkeyCode") != nil else { return }
         var id = EventHotKeyID(signature: OSType(0x4653544B), id: 1)
         var ref: EventHotKeyRef?
-        RegisterEventHotKey(UInt32(hotkeyCode), carbonModifiers(), id, GetApplicationEventTarget(), 0, &ref)
+        let status = RegisterEventHotKey(UInt32(hotkeyCode), carbonModifiers(), id, GetApplicationEventTarget(), 0, &ref)
+        FinderStackLog.write("registered popup hotkey code=\(hotkeyCode) modifiers=\(hotkeyModifiers.rawValue) status=\(status)")
         carbonHotKey = ref
-        for (_, ref) in groupHotKeys { UnregisterEventHotKey(ref) }; groupHotKeys.removeAll()
+        if UserDefaults.standard.object(forKey: "closeAllCode") != nil {
+            var closeID = EventHotKeyID(signature: OSType(0x4653544B), id: 3); var closeRef: EventHotKeyRef?
+            let closeStatus = RegisterEventHotKey(UInt32(closeAllCode), carbonModifiers(for: closeAllModifiers), closeID, GetApplicationEventTarget(), 0, &closeRef)
+            closeAllHotKey = closeRef
+            FinderStackLog.write("registered close-all code=\(closeAllCode) modifiers=\(closeAllModifiers.rawValue) status=\(closeStatus)")
+        }
+        for (index, group) in Store().groups.enumerated() {
+            guard let code = group.hotkeyCode else { continue }
+            let idValue = UInt32(1000 + index); var groupID = EventHotKeyID(signature: OSType(0x4653544B), id: idValue); var groupRef: EventHotKeyRef?
+            let groupStatus = RegisterEventHotKey(UInt32(code), carbonModifiers(for: NSEvent.ModifierFlags(rawValue: group.hotkeyModifiers)), groupID, GetApplicationEventTarget(), 0, &groupRef)
+            if let groupRef { groupHotKeys[group.id] = groupRef; groupHotKeyIDs[idValue] = group.id }
+            FinderStackLog.write("registered group name=\(group.name) code=\(code) modifiers=\(group.hotkeyModifiers) status=\(groupStatus)")
+        }
     }
 
     private func openGroupForLocalHotkey(_ event: NSEvent) -> Bool {
@@ -269,16 +304,27 @@ final class Store {
         return true
     }
 
-    private func handleHotkey(_ id: UInt32) { if id == 1 { toggle() } else if id == 2 { dismissPanel() } }
+    private func handleHotkey(_ id: UInt32) {
+        FinderStackLog.write("Carbon hotkey received id=\(id) active=\(NSApp.isActive) key=\(panel?.isKeyWindow == true) visible=\(panel?.isVisible == true)")
+        if id == 1 { toggle() }
+        else if id == 2 { dismissPanel() }
+        else if id == 3 { if NSApp.isActive && panel?.isKeyWindow == true { closeAll() } }
+        else if let groupID = groupHotKeyIDs[id], NSApp.isActive, panel?.isKeyWindow == true, let group = Store().groups.first(where: { $0.id == groupID }) {
+            let paths = group.folders.map(\.path); dismissPanel(); DispatchQueue.main.async { paths.count > 1 ? self.openFolderLayout(paths) : paths.first.map(self.openFolder) }
+        }
+    }
 
     private func registerEscapeHotkey() {
         if let escapeHotKey { UnregisterEventHotKey(escapeHotKey) }
         var id = EventHotKeyID(signature: OSType(0x4653544B), id: 2); var ref: EventHotKeyRef?
-        RegisterEventHotKey(53, 0, id, GetApplicationEventTarget(), 0, &ref); escapeHotKey = ref
+        let status = RegisterEventHotKey(53, 0, id, GetApplicationEventTarget(), 0, &ref); escapeHotKey = ref
+        FinderStackLog.write("registered Escape status=\(status)")
     }
 
     private func carbonModifiers() -> UInt32 {
-        let flags = hotkeyModifiers; var result: UInt32 = 0
+        return carbonModifiers(for: hotkeyModifiers)
+    }
+    private func carbonModifiers(for flags: NSEvent.ModifierFlags) -> UInt32 { var result: UInt32 = 0
         if flags.contains(.command) { result |= UInt32(cmdKey) }; if flags.contains(.option) { result |= UInt32(optionKey) }; if flags.contains(.control) { result |= UInt32(controlKey) }; if flags.contains(.shift) { result |= UInt32(shiftKey) }
         return result
     }
