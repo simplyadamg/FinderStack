@@ -66,14 +66,8 @@ final class Store {
     private var panel: NSPanel?
     private var timer: Timer?
     private var lastPath = ""
-    private var hotkeyMonitor: Any?
-    private var localHotkeyMonitor: Any?
     private var carbonHotKey: EventHotKeyRef?
-    private var escapeHotKey: EventHotKeyRef?
-    private var closeAllHotKey: EventHotKeyRef?
     private var carbonHandler: EventHandlerRef?
-    private var groupHotKeys: [UUID: EventHotKeyRef] = [:]
-    private var groupHotKeyIDs: [UInt32: UUID] = [:]
     private var hotkeyCode: UInt16 { UInt16(UserDefaults.standard.integer(forKey: "hotkeyCode")) }
     private var hotkeyModifiers: NSEvent.ModifierFlags { NSEvent.ModifierFlags(rawValue: UInt(UserDefaults.standard.integer(forKey: "hotkeyModifiers"))) }
     private var closeAllCode: UInt16 { UInt16(UserDefaults.standard.integer(forKey: "closeAllCode")) }
@@ -95,15 +89,6 @@ final class Store {
         menu.addItem(NSMenuItem(title: "Quit FinderStack", action: #selector(quit), keyEquivalent: ""))
         status.menu = menu
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.pollFinder() }
-        localHotkeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if let self, self.matches(event) { self.toggle(); return nil }
-            if let self, self.matchesCloseAll(event) { self.closeAll(); return nil }
-            if let self, self.openGroupForLocalHotkey(event) { return nil }
-            return event
-        }
-        hotkeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if self?.matches(event) == true { DispatchQueue.main.async { self?.toggle() } }
-        }
         installCarbonHotkey()
     }
 
@@ -119,26 +104,25 @@ final class Store {
         if let panel, panel.isVisible { dismissPanel() } else { showPanel() }
     }
 
-    private func dismissPanel() { if let escapeHotKey { UnregisterEventHotKey(escapeHotKey); self.escapeHotKey = nil }; panel?.close(); panel = nil }
+    private func dismissPanel() { FinderStackLog.write("popup dismissed"); panel?.close(); panel = nil }
 
     private func showPanel() {
-        let controller = PopupController(entries: store.entries, hotlist: store.hotlist, groups: store.groups, onHotlistChanged: { [weak self] items in self?.store.hotlist = items }, onGroupsChanged: { [weak self] items in self?.store.groups = items; self?.installCarbonHotkey() }) { [weak self] paths, isMultiSelection in
+        let controller = PopupController(entries: store.entries, hotlist: store.hotlist, groups: store.groups, onHotlistChanged: { [weak self] items in self?.store.hotlist = items }, onGroupsChanged: { [weak self] items in self?.store.groups = items }) { [weak self] paths, isMultiSelection in
             guard let self else { return }
             self.dismissPanel()
             DispatchQueue.main.async {
                 if isMultiSelection { self.openFolderLayout(paths) }
                 else if let path = paths.first { self.openFolder(path) }
             }
-        } onClose: { [weak self] in self?.dismissPanel() }
+        } onCloseAll: { [weak self] in self?.closeAll() } onClose: { [weak self] in self?.dismissPanel() }
         let p = PopupPanel(contentViewController: controller)
         p.onCancel = { [weak self] in self?.toggle() }
-        p.styleMask = [.borderless, .nonactivatingPanel]
+        p.styleMask = [.borderless]
         p.level = .floating; p.isFloatingPanel = true; p.hidesOnDeactivate = false
         p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
-        p.setContentSize(NSSize(width: 900, height: 500)); p.center(); p.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true); panel = p
+        p.setContentSize(NSSize(width: 900, height: 500)); p.center(); panel = p
+        NSApp.activate(ignoringOtherApps: true); p.makeKeyAndOrderFront(nil)
         FinderStackLog.write("popup shown active=\(NSApp.isActive) key=\(p.isKeyWindow)")
-        registerEscapeHotkey()
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
@@ -212,16 +196,6 @@ final class Store {
         NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first?.activate(options: [.activateAllWindows])
     }
 
-    private func matches(_ event: NSEvent) -> Bool {
-        guard UserDefaults.standard.object(forKey: "hotkeyCode") != nil else { return false }
-        return event.keyCode == hotkeyCode && event.modifierFlags.intersection(.deviceIndependentFlagsMask) == hotkeyModifiers.intersection(.deviceIndependentFlagsMask)
-    }
-
-    private func matchesCloseAll(_ event: NSEvent) -> Bool {
-        guard panel?.isVisible == true, NSApp.isActive, NSApp.modalWindow == nil, UserDefaults.standard.object(forKey: "closeAllCode") != nil else { return false }
-        return event.keyCode == closeAllCode && event.modifierFlags.intersection(.deviceIndependentFlagsMask) == closeAllModifiers.intersection(.deviceIndependentFlagsMask)
-    }
-
     private func closeAll() {
         FinderStackLog.write("close-all shortcut handled")
         dismissPanel()
@@ -256,9 +230,6 @@ final class Store {
 
     private func installCarbonHotkey() {
         if let carbonHotKey { UnregisterEventHotKey(carbonHotKey); self.carbonHotKey = nil }
-        if let closeAllHotKey { UnregisterEventHotKey(closeAllHotKey); self.closeAllHotKey = nil }
-        for (_, ref) in groupHotKeys { UnregisterEventHotKey(ref) }
-        groupHotKeys.removeAll(); groupHotKeyIDs.removeAll()
         if carbonHandler == nil {
             var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
             let callback: EventHandlerUPP = { _, event, userData in
@@ -277,48 +248,11 @@ final class Store {
         let status = RegisterEventHotKey(UInt32(hotkeyCode), carbonModifiers(), id, GetApplicationEventTarget(), 0, &ref)
         FinderStackLog.write("registered popup hotkey code=\(hotkeyCode) modifiers=\(hotkeyModifiers.rawValue) status=\(status)")
         carbonHotKey = ref
-        if UserDefaults.standard.object(forKey: "closeAllCode") != nil {
-            var closeID = EventHotKeyID(signature: OSType(0x4653544B), id: 3); var closeRef: EventHotKeyRef?
-            let closeStatus = RegisterEventHotKey(UInt32(closeAllCode), carbonModifiers(for: closeAllModifiers), closeID, GetApplicationEventTarget(), 0, &closeRef)
-            closeAllHotKey = closeRef
-            FinderStackLog.write("registered close-all code=\(closeAllCode) modifiers=\(closeAllModifiers.rawValue) status=\(closeStatus)")
-        }
-        for (index, group) in Store().groups.enumerated() {
-            guard let code = group.hotkeyCode else { continue }
-            let idValue = UInt32(1000 + index); var groupID = EventHotKeyID(signature: OSType(0x4653544B), id: idValue); var groupRef: EventHotKeyRef?
-            let groupStatus = RegisterEventHotKey(UInt32(code), carbonModifiers(for: NSEvent.ModifierFlags(rawValue: group.hotkeyModifiers)), groupID, GetApplicationEventTarget(), 0, &groupRef)
-            if let groupRef { groupHotKeys[group.id] = groupRef; groupHotKeyIDs[idValue] = group.id }
-            FinderStackLog.write("registered group name=\(group.name) code=\(code) modifiers=\(group.hotkeyModifiers) status=\(groupStatus)")
-        }
-    }
-
-    private func openGroupForLocalHotkey(_ event: NSEvent) -> Bool {
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
-        guard NSApp.modalWindow == nil, !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended"), let group = Store().groups.first(where: { $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == flags }) else { return false }
-        let paths = group.folders.map(\.path)
-        dismissPanel()
-        DispatchQueue.main.async {
-            if paths.count > 1 { self.openFolderLayout(paths) }
-            else if let path = paths.first { self.openFolder(path) }
-        }
-        return true
     }
 
     private func handleHotkey(_ id: UInt32) {
         FinderStackLog.write("Carbon hotkey received id=\(id) active=\(NSApp.isActive) key=\(panel?.isKeyWindow == true) visible=\(panel?.isVisible == true)")
         if id == 1 { toggle() }
-        else if id == 2 { dismissPanel() }
-        else if id == 3 { if NSApp.isActive && panel?.isKeyWindow == true { closeAll() } }
-        else if let groupID = groupHotKeyIDs[id], NSApp.isActive, panel?.isKeyWindow == true, let group = Store().groups.first(where: { $0.id == groupID }) {
-            let paths = group.folders.map(\.path); dismissPanel(); DispatchQueue.main.async { paths.count > 1 ? self.openFolderLayout(paths) : paths.first.map(self.openFolder) }
-        }
-    }
-
-    private func registerEscapeHotkey() {
-        if let escapeHotKey { UnregisterEventHotKey(escapeHotKey) }
-        var id = EventHotKeyID(signature: OSType(0x4653544B), id: 2); var ref: EventHotKeyRef?
-        let status = RegisterEventHotKey(53, 0, id, GetApplicationEventTarget(), 0, &ref); escapeHotKey = ref
-        FinderStackLog.write("registered Escape status=\(status)")
     }
 
     private func carbonModifiers() -> UInt32 {
@@ -355,6 +289,8 @@ final class HotkeyField: NSTextField {
 
 final class PopupPanel: NSPanel {
     var onCancel: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
     override func cancelOperation(_ sender: Any?) { onCancel?() }
 }
 
@@ -367,17 +303,17 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
     private let folderPasteboardType = NSPasteboard.PasteboardType("com.finderstack.folder-path")
     private let groupPasteboardType = NSPasteboard.PasteboardType("com.finderstack.group-id")
     private let entries: [FolderEntry]; private var hotlist: [FolderEntry]; private var groups: [FolderGroup]
-    private let onHotlistChanged: ([FolderEntry]) -> Void; private let onGroupsChanged: ([FolderGroup]) -> Void; private let onOpen: ([String], Bool) -> Void; private let onClose: () -> Void
+    private let onHotlistChanged: ([FolderEntry]) -> Void; private let onGroupsChanged: ([FolderGroup]) -> Void; private let onOpen: ([String], Bool) -> Void; private let onCloseAll: () -> Void; private let onClose: () -> Void
     private let search = NSSearchField(), recentTable = NSTableView(), hotlistTable = NSTableView(), groupTable = GroupTableView()
     private let recentScroll = NSScrollView(), hotlistScroll = NSScrollView(), groupScroll = NSScrollView()
-    private var filteredRecent: [FolderEntry] = [], filteredHotlist: [FolderEntry] = [], filteredGroups: [FolderGroup] = [], selected: [FolderEntry] = []; private var flagsMonitor: Any?; private var escapeMonitor: Any?
+    private var filteredRecent: [FolderEntry] = [], filteredHotlist: [FolderEntry] = [], filteredGroups: [FolderGroup] = [], selected: [FolderEntry] = []; private var flagsMonitor: Any?; private var popupKeyMonitor: Any?
     private var editingGroupID: UUID?
     private let backButton = NSButton(title: "‹", target: nil, action: nil)
     private let groupHeader = NSTextField(labelWithString: "GROUPS")
     private let positionLabels = ["UR", "LR", "UL", "LL"]
     private let positionColors: [NSColor] = [.systemBlue, .systemGreen, .systemOrange, .systemPurple]
-    init(entries: [FolderEntry], hotlist: [FolderEntry], groups: [FolderGroup], onHotlistChanged: @escaping ([FolderEntry]) -> Void, onGroupsChanged: @escaping ([FolderGroup]) -> Void, onOpen: @escaping ([String], Bool) -> Void, onClose: @escaping () -> Void) {
-        self.entries = entries; self.hotlist = hotlist; self.groups = groups; self.onHotlistChanged = onHotlistChanged; self.onGroupsChanged = onGroupsChanged; self.onOpen = onOpen; self.onClose = onClose
+    init(entries: [FolderEntry], hotlist: [FolderEntry], groups: [FolderGroup], onHotlistChanged: @escaping ([FolderEntry]) -> Void, onGroupsChanged: @escaping ([FolderGroup]) -> Void, onOpen: @escaping ([String], Bool) -> Void, onCloseAll: @escaping () -> Void, onClose: @escaping () -> Void) {
+        self.entries = entries; self.hotlist = hotlist; self.groups = groups; self.onHotlistChanged = onHotlistChanged; self.onGroupsChanged = onGroupsChanged; self.onOpen = onOpen; self.onCloseAll = onCloseAll; self.onClose = onClose
         filteredRecent = entries; filteredHotlist = hotlist; filteredGroups = groups; super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -408,11 +344,20 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
     }
     override func viewDidAppear() {
         search.becomeFirstResponder()
-        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        guard popupKeyMonitor == nil else { return }
+        FinderStackLog.write("popup local key handling started active=\(NSApp.isActive) key=\(view.window?.isKeyWindow == true)")
+        popupKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
+            guard self.view.window?.isKeyWindow == true, NSApp.modalWindow == nil, !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended") else { return event }
             if event.keyCode == 53 { self.onClose(); return nil }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
-            if NSApp.isActive, NSApp.modalWindow == nil, !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended"), let group = self.groups.first(where: { $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == flags }) {
+            if UserDefaults.standard.object(forKey: "closeAllCode") != nil, event.keyCode == UInt16(UserDefaults.standard.integer(forKey: "closeAllCode")), flags == UInt(UserDefaults.standard.integer(forKey: "closeAllModifiers")) {
+                FinderStackLog.write("popup local close-all matched code=\(event.keyCode) modifiers=\(flags)")
+                self.onCloseAll()
+                return nil
+            }
+            if let group = self.groups.first(where: { $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == flags }) {
+                FinderStackLog.write("popup local group matched name=\(group.name) code=\(event.keyCode) modifiers=\(flags)")
                 self.onOpen(group.folders.map(\.path), group.folders.count > 1)
                 return nil
             }
@@ -424,7 +369,14 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
             return event
         }
     }
-    override func viewWillDisappear() { if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }; if let flagsMonitor { NSEvent.removeMonitor(flagsMonitor) }; self.escapeMonitor = nil; self.flagsMonitor = nil }
+    override func viewWillDisappear() { endPopupKeyHandling() }
+    deinit { endPopupKeyHandling() }
+    private func endPopupKeyHandling() {
+        if let popupKeyMonitor { NSEvent.removeMonitor(popupKeyMonitor) }
+        if let flagsMonitor { NSEvent.removeMonitor(flagsMonitor) }
+        popupKeyMonitor = nil; flagsMonitor = nil
+        FinderStackLog.write("popup local key handling stopped")
+    }
     func controlTextDidChange(_ obj: Notification) { applyFilter() }
     private func applyFilter() {
         let q = search.stringValue.lowercased(), matches: (FolderEntry) -> Bool = { q.isEmpty || ($0.name + " " + $0.parent).lowercased().contains(q) }
