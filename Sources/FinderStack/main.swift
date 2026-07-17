@@ -375,13 +375,14 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
         scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.scrollerStyle = .overlay; scroll.drawsBackground = false; view.addSubview(scroll)
     }
     override func viewDidAppear() {
-        search.becomeFirstResponder()
+        view.window?.makeFirstResponder(nil)
         guard popupKeyMonitor == nil else { return }
-        FinderStackLog.write("popup local key handling started active=\(NSApp.isActive) key=\(view.window?.isKeyWindow == true)")
+        FinderStackLog.write("popup local key handling started active=\(NSApp.isActive) key=\(view.window?.isKeyWindow == true) searchFocused=false")
         popupKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             guard self.view.window?.isKeyWindow == true, NSApp.modalWindow == nil, !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended") else { return event }
             if event.keyCode == 53 { self.onClose(); return nil }
+            guard self.search.currentEditor() == nil else { return event }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
             if UserDefaults.standard.object(forKey: "closeAllCode") != nil, event.keyCode == UInt16(UserDefaults.standard.integer(forKey: "closeAllCode")), flags == UInt(UserDefaults.standard.integer(forKey: "closeAllModifiers")) {
                 FinderStackLog.write("popup local close-all matched code=\(event.keyCode) modifiers=\(flags)")
@@ -404,6 +405,9 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
     override func viewWillDisappear() { endPopupKeyHandling() }
     deinit { endPopupKeyHandling() }
     private func endPopupKeyHandling() {
+        view.window?.makeFirstResponder(nil)
+        search.abortEditing()
+        search.stringValue = ""
         if let popupKeyMonitor { NSEvent.removeMonitor(popupKeyMonitor) }
         if let flagsMonitor { NSEvent.removeMonitor(flagsMonitor) }
         popupKeyMonitor = nil; flagsMonitor = nil
