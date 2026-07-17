@@ -121,8 +121,28 @@ final class Store {
         p.level = .floating; p.isFloatingPanel = true; p.hidesOnDeactivate = false
         p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
         p.setContentSize(NSSize(width: 900, height: 500)); p.center(); panel = p
-        NSApp.activate(ignoringOtherApps: true); p.makeKeyAndOrderFront(nil)
-        FinderStackLog.write("popup shown active=\(NSApp.isActive) key=\(p.isKeyWindow)")
+        p.orderFrontRegardless()
+        activatePopup(p, attempt: 0)
+    }
+
+    private func activatePopup(_ popup: PopupPanel, attempt: Int) {
+        guard panel === popup, popup.isVisible else { return }
+        NSApp.activate()
+        popup.makeKeyAndOrderFront(nil)
+        if NSApp.isActive && popup.isKeyWindow {
+            FinderStackLog.write("popup activation succeeded attempt=\(attempt) active=true key=true")
+            return
+        }
+        let delays = [0.03, 0.08, 0.16, 0.30, 0.55]
+        guard attempt < delays.count else {
+            FinderStackLog.write("popup activation exhausted retries active=\(NSApp.isActive) key=\(popup.isKeyWindow) visible=\(popup.isVisible)")
+            return
+        }
+        FinderStackLog.write("popup activation pending attempt=\(attempt) active=\(NSApp.isActive) key=\(popup.isKeyWindow)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delays[attempt]) { [weak self, weak popup] in
+            guard let self, let popup else { return }
+            self.activatePopup(popup, attempt: attempt + 1)
+        }
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
@@ -380,7 +400,7 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
         FinderStackLog.write("popup local key handling started active=\(NSApp.isActive) key=\(view.window?.isKeyWindow == true) searchFocused=false")
         popupKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
-            guard self.view.window?.isKeyWindow == true, NSApp.modalWindow == nil, !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended") else { return event }
+            guard self.view.window?.isVisible == true, NSApp.modalWindow == nil, !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended") else { return event }
             if event.keyCode == 53 { self.onClose(); return nil }
             guard self.search.currentEditor() == nil else { return event }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
