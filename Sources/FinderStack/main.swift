@@ -36,6 +36,11 @@ private extension Array {
     subscript(safe index: Index) -> Element? { indices.contains(index) ? self[index] : nil }
 }
 
+private let shortcutModifierMask: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+private func normalizedShortcutModifiers(_ flags: NSEvent.ModifierFlags) -> UInt {
+    flags.intersection(shortcutModifierMask).rawValue
+}
+
 final class Store {
     private let key = "folderHistory"
     private let hotlistKey = "folderHotlist"
@@ -259,7 +264,7 @@ final class Store {
         let field = HotkeyField(frame: NSRect(x: 0, y: 0, width: 260, height: 28)); field.isEditable = false; field.isSelectable = false; field.stringValue = hotkeyCode == 0 ? "Press a shortcut…" : "Current shortcut: \(hotkeyLabel())"; alert.accessoryView = field
         alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn, let event = field.event else { return }
-        UserDefaults.standard.set(Int(event.keyCode), forKey: "hotkeyCode"); UserDefaults.standard.set(Int(event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue), forKey: "hotkeyModifiers"); UserDefaults.standard.set(HotkeyField.display(for: event), forKey: "hotkeyDisplay")
+        UserDefaults.standard.set(Int(event.keyCode), forKey: "hotkeyCode"); UserDefaults.standard.set(Int(normalizedShortcutModifiers(event.modifierFlags)), forKey: "hotkeyModifiers"); UserDefaults.standard.set(HotkeyField.display(for: event), forKey: "hotkeyDisplay")
         installCarbonHotkey()
     }
 
@@ -267,8 +272,8 @@ final class Store {
         let alert = NSAlert(); alert.messageText = "Set Close All Hotkey"; alert.informativeText = "This shortcut works only while the FinderStack popup is focused."; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
         let field = HotkeyField(frame: NSRect(x: 0, y: 0, width: 260, height: 28)); field.isEditable = false; field.isSelectable = false; field.stringValue = UserDefaults.standard.object(forKey: "closeAllCode") == nil ? "Press a shortcut…" : "Current shortcut: \(hotkeyLabel(key: closeAllCode, modifiers: closeAllModifiers.rawValue, displayKey: "closeAllDisplay") )"; alert.accessoryView = field; alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn, let event = field.event else { return }
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
-        let conflicts = (UserDefaults.standard.object(forKey: "hotkeyCode") != nil && hotkeyCode == event.keyCode && hotkeyModifiers.rawValue == modifiers) || Store().groups.contains { $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == modifiers }
+        let modifiers = normalizedShortcutModifiers(event.modifierFlags)
+        let conflicts = (UserDefaults.standard.object(forKey: "hotkeyCode") != nil && hotkeyCode == event.keyCode && normalizedShortcutModifiers(hotkeyModifiers) == modifiers) || Store().groups.contains { $0.hotkeyCode == event.keyCode && normalizedShortcutModifiers(NSEvent.ModifierFlags(rawValue: $0.hotkeyModifiers)) == modifiers }
         guard !conflicts else { NSAlert(error: NSError(domain: "FinderStack", code: 2, userInfo: [NSLocalizedDescriptionKey: "That shortcut is already assigned to FinderStack or a group."])).runModal(); return }
         UserDefaults.standard.set(Int(event.keyCode), forKey: "closeAllCode"); UserDefaults.standard.set(Int(modifiers), forKey: "closeAllModifiers"); UserDefaults.standard.set(HotkeyField.display(for: event), forKey: "closeAllDisplay")
     }
@@ -403,13 +408,14 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
             guard self.view.window?.isVisible == true, NSApp.modalWindow == nil, !UserDefaults.standard.bool(forKey: "groupHotkeysSuspended") else { return event }
             if event.keyCode == 53 { self.onClose(); return nil }
             guard self.search.currentEditor() == nil else { return event }
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
-            if UserDefaults.standard.object(forKey: "closeAllCode") != nil, event.keyCode == UInt16(UserDefaults.standard.integer(forKey: "closeAllCode")), flags == UInt(UserDefaults.standard.integer(forKey: "closeAllModifiers")) {
+            let flags = normalizedShortcutModifiers(event.modifierFlags)
+            let closeAllFlags = normalizedShortcutModifiers(NSEvent.ModifierFlags(rawValue: UInt(UserDefaults.standard.integer(forKey: "closeAllModifiers"))))
+            if UserDefaults.standard.object(forKey: "closeAllCode") != nil, event.keyCode == UInt16(UserDefaults.standard.integer(forKey: "closeAllCode")), flags == closeAllFlags {
                 FinderStackLog.write("popup local close-all matched code=\(event.keyCode) modifiers=\(flags)")
                 self.onCloseAll()
                 return nil
             }
-            if let group = self.groups.first(where: { $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == flags }) {
+            if let group = self.groups.first(where: { $0.hotkeyCode == event.keyCode && normalizedShortcutModifiers(NSEvent.ModifierFlags(rawValue: $0.hotkeyModifiers)) == flags }) {
                 FinderStackLog.write("popup local group matched name=\(group.name) code=\(event.keyCode) modifiers=\(flags)")
                 self.onOpen(group.folders.map(\.path), group.folders.count > 1)
                 return nil
@@ -511,7 +517,7 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
     @objc private func editGroup(_ sender: NSButton) { guard filteredGroups.indices.contains(sender.tag) else { return }; openGroupEditor(filteredGroups[sender.tag]) }
     @objc private func renameGroup(_ sender: NSMenuItem) { guard filteredGroups.indices.contains(sender.tag) else { return }; var group = filteredGroups[sender.tag]; let alert = NSAlert(); alert.messageText = "Rename Group"; let field = NSTextField(string: group.name); alert.accessoryView = field; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field; UserDefaults.standard.set(true, forKey: "groupHotkeysSuspended"); defer { UserDefaults.standard.set(false, forKey: "groupHotkeysSuspended") }; guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }; group.name = field.stringValue; groups = groups.map { $0.id == group.id ? group : $0 }; onGroupsChanged(groups); applyFilter() }
     @objc private func deleteGroup(_ sender: NSButton) { guard filteredGroups.indices.contains(sender.tag) else { return }; let group = filteredGroups[sender.tag]; let alert = NSAlert(); alert.messageText = "Delete \(group.name)?"; alert.informativeText = "The folders will remain in Recent and Hotlist."; alert.addButton(withTitle: "Delete"); alert.addButton(withTitle: "Cancel"); guard alert.runModal() == .alertFirstButtonReturn else { return }; groups.removeAll { $0.id == group.id }; onGroupsChanged(groups); applyFilter() }
-    @objc private func groupHotkey(_ sender: NSButton) { guard filteredGroups.indices.contains(sender.tag) else { return }; let group = filteredGroups[sender.tag]; let alert = NSAlert(); alert.messageText = "Set Hotkey for \(group.name)"; alert.informativeText = "Press the shortcut you want to open this group."; let field = HotkeyField(frame: NSRect(x: 0, y: 0, width: 260, height: 28)); field.isEditable = false; field.isSelectable = false; field.stringValue = "Press a shortcut…"; alert.accessoryView = field; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field; UserDefaults.standard.set(true, forKey: "groupHotkeysSuspended"); defer { UserDefaults.standard.set(false, forKey: "groupHotkeysSuspended") }; guard alert.runModal() == .alertFirstButtonReturn, let event = field.event else { return }; let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue; let mainConflict = UserDefaults.standard.object(forKey: "hotkeyCode") != nil && UInt16(UserDefaults.standard.integer(forKey: "hotkeyCode")) == event.keyCode && UInt(UserDefaults.standard.integer(forKey: "hotkeyModifiers")) == modifiers; let groupConflict = groups.contains { $0.id != group.id && $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == modifiers }; guard !mainConflict && !groupConflict else { NSAlert(error: NSError(domain: "FinderStack", code: 1, userInfo: [NSLocalizedDescriptionKey: "That shortcut is already assigned to FinderStack or another group."])).runModal(); return }; groups = groups.map { var item = $0; if item.id == group.id { item.hotkeyCode = event.keyCode; item.hotkeyModifiers = modifiers; item.hotkeyDisplay = HotkeyField.display(for: event) }; return item }; onGroupsChanged(groups); applyFilter() }
+    @objc private func groupHotkey(_ sender: NSButton) { guard filteredGroups.indices.contains(sender.tag) else { return }; let group = filteredGroups[sender.tag]; let alert = NSAlert(); alert.messageText = "Set Hotkey for \(group.name)"; alert.informativeText = "Press the shortcut you want to open this group."; let field = HotkeyField(frame: NSRect(x: 0, y: 0, width: 260, height: 28)); field.isEditable = false; field.isSelectable = false; field.stringValue = "Press a shortcut…"; alert.accessoryView = field; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field; UserDefaults.standard.set(true, forKey: "groupHotkeysSuspended"); defer { UserDefaults.standard.set(false, forKey: "groupHotkeysSuspended") }; guard alert.runModal() == .alertFirstButtonReturn, let event = field.event else { return }; let modifiers = normalizedShortcutModifiers(event.modifierFlags); let mainModifiers = normalizedShortcutModifiers(NSEvent.ModifierFlags(rawValue: UInt(UserDefaults.standard.integer(forKey: "hotkeyModifiers")))); let mainConflict = UserDefaults.standard.object(forKey: "hotkeyCode") != nil && UInt16(UserDefaults.standard.integer(forKey: "hotkeyCode")) == event.keyCode && mainModifiers == modifiers; let groupConflict = groups.contains { $0.id != group.id && $0.hotkeyCode == event.keyCode && normalizedShortcutModifiers(NSEvent.ModifierFlags(rawValue: $0.hotkeyModifiers)) == modifiers }; guard !mainConflict && !groupConflict else { NSAlert(error: NSError(domain: "FinderStack", code: 1, userInfo: [NSLocalizedDescriptionKey: "That shortcut is already assigned to FinderStack or another group."])).runModal(); return }; groups = groups.map { var item = $0; if item.id == group.id { item.hotkeyCode = event.keyCode; item.hotkeyModifiers = modifiers; item.hotkeyDisplay = HotkeyField.display(for: event) }; return item }; onGroupsChanged(groups); applyFilter() }
     private func contextMenu(for row: Int) -> NSMenu? { guard editingGroupID == nil, filteredGroups.indices.contains(row) else { return nil }; let menu = NSMenu(); for (title, action) in [("Rename", #selector(renameGroup(_:))), ("Remove", #selector(deleteGroup(_:))), ("Edit Group", #selector(editGroup(_:))), ("Reassign Hotkey", #selector(groupHotkey(_:)))] { let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; item.tag = row; menu.addItem(item) }; return menu }
     private func openGroupEditor(_ group: FolderGroup) { editingGroupID = group.id; backButton.isHidden = false; groupHeader.stringValue = "\(group.name)  \(group.hotkeyDisplay ?? "")"; groupTable.reloadData() }
     @objc private func backToGroups() { editingGroupID = nil; backButton.isHidden = true; groupHeader.stringValue = "GROUPS"; groupTable.reloadData() }
